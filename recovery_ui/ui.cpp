@@ -630,7 +630,7 @@ RecoveryUI::InputEvent RecoveryUI::WaitInputEvent() {
         // Drop the first key if it's changing from OFF to NORMAL.
         if (screensaver_state_ == ScreensaverState::OFF) {
           if (event_queue_len > 0) {
-            memcpy(&event_queue[0], &event_queue[1], sizeof(int) * --event_queue_len);
+            memmove(&event_queue[0], &event_queue[1], sizeof(InputEvent) * --event_queue_len);
           }
         }
 
@@ -643,7 +643,7 @@ RecoveryUI::InputEvent RecoveryUI::WaitInputEvent() {
   InputEvent event;
   if (event_queue_len > 0) {
     event = event_queue[0];
-    memcpy(&event_queue[0], &event_queue[1], sizeof(InputEvent) * --event_queue_len);
+    memmove(&event_queue[0], &event_queue[1], sizeof(InputEvent) * --event_queue_len);
   }
   return event;
 }
