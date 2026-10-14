@@ -26,6 +26,7 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#include <chrono>
 #include <functional>
 #include <iterator>
 #include <memory>
@@ -55,6 +56,7 @@
 #include "install/snapshot_utils.h"
 #include "install/wipe_data.h"
 #include "install/wipe_device.h"
+#include "root_install.h"
 #include "otautil/error_code.h"
 #include "otautil/package.h"
 #include "otautil/paths.h"
@@ -205,13 +207,14 @@ std::string get_chosen_slot(Device* device) {
   size_t chosen_item = device->GetUI()->ShowMenu(
       headers, items, 0, true,
       std::bind(&Device::HandleMenuKey, device, std::placeholders::_1, std::placeholders::_2));
-  if (chosen_item < 0)
+  if (chosen_item >= items.size())
     return "";
   return items[chosen_item];
 }
 
 int set_slot(Device* device) {
   std::string slot = get_chosen_slot(device);
+  if (slot.empty()) return -1;  // Cancel without calling boot control.
   CommandResult ret;
   auto cb = [&ret](CommandResult result) { ret = result; };
   Slot sslot = (slot == "A") ? 0 : 1;
@@ -545,7 +548,9 @@ static bool AskToReboot(Device* device, Device::BuiltinAction chosen_action) {
 // Shows the recovery UI and waits for user input. Returns one of the device builtin actions, such
 // as REBOOT, SHUTDOWN, or REBOOT_BOOTLOADER. Returning NO_ACTION means to take the default, which
 // is to reboot or shutdown depending on if the --shutdown_after flag was passed to recovery.
-static Device::BuiltinAction PromptAndWait(Device* device, InstallResult status) {
+static Device::BuiltinAction PromptAndWait(Device* device, InstallResult status,
+                                          bool reboot_before_magisk) {
+  // After sideload or a slot change, reboot before patching the next boot image.
   auto ui = device->GetUI();
   bool update_in_progress = (device->GetReason().value_or("") == "update_in_progress");
   for (;;) {
@@ -705,6 +710,7 @@ change_menu:
 
         ui->Print("\nInstall completed with status %d.\n", status);
         if (status == INSTALL_SUCCESS) {
+          reboot_before_magisk = true;
           update_in_progress = false;
           if (!ui->IsTextVisible()) {
             return Device::NO_ACTION;  // reboot if logs aren't visible
@@ -722,15 +728,59 @@ change_menu:
         break;
 
       case Device::ENABLE_ADB:
-        android::base::SetProperty("ro.adb.secure.recovery", "0");
-        android::base::SetProperty("ctl.restart", "adbd");
+        // Init owns read-only property creation and adbd service control. Recovery
+        // can request this action through the existing USB configuration property.
+        if (!android::base::SetProperty("sys.usb.config.recovery_adb", "requested") ||
+            !android::base::WaitForProperty("sys.usb.config.recovery_adb", "enabled",
+                                           std::chrono::seconds(5)) ||
+            !android::base::WaitForProperty("ro.adb.secure.recovery", "0",
+                                           std::chrono::seconds(1))) {
+          ui->Print("Could not enable recovery ADB. See recovery logs; you can retry.\n");
+          break;
+        }
         device->RemoveMenuItemForAction(Device::ENABLE_ADB);
         device->GoHome();
-        ui->Print("Enabled ADB.\n");
+        ui->Print("Enabled recovery ADB.\n");
         break;
 
+      case Device::INSTALL_MAGISK:
+      case Device::INSTALL_APATCH: {
+        const bool apatch = chosen_action == Device::INSTALL_APATCH;
+        if (update_in_progress || reboot_before_magisk) {
+          ui->Print("Reboot recovery after an update or slot change before installing root.\n");
+          break;
+        }
+        if (android::base::GetBoolProperty("ro.virtual_ab.enabled", false) &&
+            !IsCancelUpdateSafe(device)) {
+          ui->Print("Finish the pending system update before installing root.\n");
+          break;
+        }
+        if (yes_no(device, apatch ? "Install bundled APatch 11224?" : "Install bundled Magisk v31.0?",
+                   "Modifies current boot; no persistent backup. Install manager after reboot.")) {
+          save_current_log = true;
+          const bool success = apatch ? InstallBundledAPatch(ui) : InstallBundledMagisk(ui);
+          status = success ? INSTALL_SUCCESS : INSTALL_ERROR;
+          copy_logs(save_current_log);
+          // Keep the result available instead of immediately hiding it behind a menu.
+          for (;;) {
+            std::vector<std::string> result_headers{
+              status == INSTALL_SUCCESS ? "Root installation completed" : "Root installation failed",
+              status == INSTALL_SUCCESS ? "Reboot system, then install the matching manager app."
+                                       : "Open the recovery log for details."
+            };
+            size_t result_item = ui->ShowMenu(
+                result_headers, { "Continue", "View recovery log" }, 0, true,
+                std::bind(&Device::HandleMenuKey, device, std::placeholders::_1,
+                          std::placeholders::_2));
+            if (result_item != 1) break;
+            ui->ShowFile(Paths::Get().temporary_log_file());
+          }
+        }
+        break;
+      }
+
       case Device::SWAP_SLOT:
-        set_slot(device);
+        if (set_slot(device) >= 0) reboot_before_magisk = true;
         break;
 
       case Device::RUN_GRAPHICS_TEST:
@@ -1136,7 +1186,7 @@ Device::BuiltinAction start_recovery(Device* device, const std::vector<std::stri
     next_action = Device::REBOOT_RECOVERY;
   } else if (status != INSTALL_REBOOT) {
     if (status == INSTALL_NONE || ui->IsTextVisible()) {
-      auto temp = PromptAndWait(device, status);
+      auto temp = PromptAndWait(device, status, update_package != nullptr || sideload || rescue);
       if (temp != Device::NO_ACTION) {
         next_action = temp;
       }

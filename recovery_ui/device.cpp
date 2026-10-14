@@ -39,6 +39,8 @@ static std::vector<menu_action_t> g_main_actions{
 
 static std::vector<std::string> g_advanced_header{ "Advanced options" };
 static std::vector<menu_action_t> g_advanced_actions{
+  { "Install Magisk v31.0 (bundled)", Device::INSTALL_MAGISK },
+  { "Install APatch 11224 (bundled)", Device::INSTALL_APATCH },
   { "Enter fastboot", Device::ENTER_FASTBOOT },
   { "Reboot to bootloader", Device::REBOOT_BOOTLOADER },
   { "Reboot to recovery", Device::REBOOT_RECOVERY },
