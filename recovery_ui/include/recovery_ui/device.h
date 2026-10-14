@@ -76,6 +76,7 @@ class Device {
     SWAP_SLOT = 102,
     WIPE_DATA_F2FS = 103,
     WIPE_CACHE_F2FS = 104,
+    INSTALL_MAGISK = 105,
     MENU_BASE = 200,
     MENU_WIPE = 202,
     MENU_ADVANCED = 203,
