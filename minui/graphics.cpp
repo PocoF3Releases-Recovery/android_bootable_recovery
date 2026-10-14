@@ -45,6 +45,23 @@ static GRSurface* gr_draw = nullptr;
 static GRRotation rotation = GRRotation::NONE;
 static GRRotation touch_rotation = GRRotation::NONE;
 static PixelFormat pixel_format = PixelFormat::UNKNOWN;
+static bool clip_enabled = false;
+static int clip_left, clip_top, clip_right, clip_bottom;
+
+void gr_clip(int x, int y, int width, int height) {
+  const bool swapped = rotation == GRRotation::LEFT || rotation == GRRotation::RIGHT;
+  const int limit_x = swapped ? gr_draw->height : gr_draw->width;
+  const int limit_y = swapped ? gr_draw->width : gr_draw->height;
+  clip_left = std::clamp(x + overscan_offset_x, 0, limit_x);
+  clip_top = std::clamp(y + overscan_offset_y, 0, limit_y);
+  clip_right = std::clamp(x + std::max(0, width) + overscan_offset_x, clip_left, limit_x);
+  clip_bottom = std::clamp(y + std::max(0, height) + overscan_offset_y, clip_top, limit_y);
+  clip_enabled = true;
+}
+
+void gr_reset_clip() {
+  clip_enabled = false;
+}
 // The graphics backend list that provides fallback options for the default backend selection.
 // For example, it will fist try DRM, then try FBDEV if DRM is unavailable.
 constexpr auto default_backends = { GraphicsBackend::DRM, GraphicsBackend::FBDEV };
@@ -228,7 +245,9 @@ void gr_text(const GRFont* font, int x, int y, const char* s, bool bold) {
 
   unsigned char ch;
   while ((ch = *s++)) {
-    if (outside(x, y) || outside(x + font->char_width - 1, y + font->char_height - 1)) break;
+    if (!clip_enabled &&
+        (outside(x, y) || outside(x + font->char_width - 1, y + font->char_height - 1)))
+      break;
 
     if (ch < ' ' || ch > '~') {
       ch = '?';
@@ -237,10 +256,17 @@ void gr_text(const GRFont* font, int x, int y, const char* s, bool bold) {
     int row_pixels = gr_draw->row_bytes / gr_draw->pixel_bytes;
     const uint8_t* src_p = font->texture->data() + ((ch - ' ') * font->char_width) +
                            (bold ? font->char_height * font->texture->row_bytes : 0);
-    uint32_t* dst_p = PixelAt(gr_draw, x, y, row_pixels);
-
-    TextBlend(src_p, font->texture->row_bytes, dst_p, row_pixels, font->char_width,
-              font->char_height);
+    const int left = clip_enabled ? std::max(x, clip_left) : x;
+    const int top = clip_enabled ? std::max(y, clip_top) : y;
+    const int right =
+        clip_enabled ? std::min(x + font->char_width, clip_right) : x + font->char_width;
+    const int bottom =
+        clip_enabled ? std::min(y + font->char_height, clip_bottom) : y + font->char_height;
+    if (left < right && top < bottom) {
+      src_p += (top - y) * font->texture->row_bytes + left - x;
+      uint32_t* dst_p = PixelAt(gr_draw, left, top, row_pixels);
+      TextBlend(src_p, font->texture->row_bytes, dst_p, row_pixels, right - left, bottom - top);
+    }
 
     x += font->char_width;
   }
@@ -302,7 +328,13 @@ void gr_fill(int x1, int y1, int x2, int y2) {
   x2 += overscan_offset_x;
   y2 += overscan_offset_y;
 
-  if (outside(x1, y1) || outside(x2 - 1, y2 - 1)) return;
+  if (clip_enabled) {
+    x1 = std::max(x1, clip_left);
+    y1 = std::max(y1, clip_top);
+    x2 = std::min(x2, clip_right);
+    y2 = std::min(y2, clip_bottom);
+  }
+  if (x1 >= x2 || y1 >= y2 || outside(x1, y1) || outside(x2 - 1, y2 - 1)) return;
 
   int row_pixels = gr_draw->row_bytes / gr_draw->pixel_bytes;
   uint32_t* p = PixelAt(gr_draw, x1, y1, row_pixels);
@@ -411,7 +443,12 @@ int gr_init_font(const char* name, GRFont** dest) {
 }
 
 void gr_flip() {
-  gr_draw = gr_backend->Flip();
+  // Only a persistent software canvas is safe to draw into while a failed
+  // presentation still has an outstanding scanout completion.
+  if (auto* surface = gr_backend->Flip())
+    gr_draw = surface;
+  else if (!gr_backend->HasPersistentBuffer())
+    gr_draw = nullptr;
 }
 
 std::unique_ptr<MinuiBackend> create_backend(GraphicsBackend backend) {
@@ -488,11 +525,13 @@ int gr_init(std::initializer_list<GraphicsBackend> backends) {
       android::base::GetBoolProperty("ro.minui.no_initial_modset_flush", false);
 
   if (!no_initial_modset_flush) {
-    gr_flip();
-    gr_flip();
-    if (!gr_draw) {
-      printf("gr_init: gr_draw becomes nullptr after gr_flip\n");
-      return -1;
+    for (int i = 0; i < 2; ++i) {
+      auto* surface = gr_backend->Flip();
+      if (!surface) {
+        printf("gr_init: no drawing surface after initial flip\n");
+        return -1;
+      }
+      gr_draw = surface;
     }
   }
 
@@ -587,6 +626,10 @@ GRRotation gr_get_rotation() {
 
 void gr_rotate_touch(GRRotation rot) {
   touch_rotation = rot;
+}
+
+bool gr_has_persistent_buffer() {
+  return gr_backend->HasPersistentBuffer();
 }
 
 bool gr_has_multiple_connectors() {
